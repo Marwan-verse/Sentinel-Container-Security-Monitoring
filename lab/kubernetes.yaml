@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinel-lab
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: insecure-demo
+  namespace: sentinel-lab
+  labels:
+    app: sentinel-demo
+spec:
+  containers:
+    - name: insecure-demo
+      image: alpine:3.20
+      command: ["sh", "-c", "while true; do sleep 30; done"]
+      securityContext:
+        privileged: true
+        runAsUser: 0
+        allowPrivilegeEscalation: true
+        capabilities:
+          add: ["NET_ADMIN"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-demo
+  namespace: sentinel-lab
+  labels:
+    app: sentinel-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: crash-demo
+      image: alpine:3.20
+      command: ["sh", "-c", "echo 'intentional lab exit'; exit 1"]

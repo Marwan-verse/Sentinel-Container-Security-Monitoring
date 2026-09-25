@@ -1,0 +1,16 @@
+name: sentinel-lab
+services:
+  insecure-demo:
+    image: alpine:3.20
+    container_name: sentinel-demo-insecure
+    command: ["sh", "-c", "while true; do sleep 30; done"]
+    user: "0"
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    restart: "no"
+  crash-demo:
+    image: alpine:3.20
+    container_name: sentinel-demo-crash
+    command: ["sh", "-c", "echo 'intentional lab exit'; exit 1"]
+    restart: "no"

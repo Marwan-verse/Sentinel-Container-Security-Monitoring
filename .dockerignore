@@ -1,0 +1,9 @@
+.venv
+data
+frontend/node_modules
+frontend/dist
+.playwright-cli
+.git
+tests
+__pycache__
+*.pyc

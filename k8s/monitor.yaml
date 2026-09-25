@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinel-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinel-monitor
+  namespace: sentinel-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sentinel-monitor-read
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sentinel-monitor-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sentinel-monitor-read
+subjects:
+  - kind: ServiceAccount
+    name: sentinel-monitor
+    namespace: sentinel-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-monitor
+  namespace: sentinel-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sentinel-monitor
+  template:
+    metadata:
+      labels:
+        app: sentinel-monitor
+    spec:
+      serviceAccountName: sentinel-monitor
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: monitor
+          image: sentinel-monitor:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: SENTINEL_MODE
+              value: kubernetes
+            - name: SENTINEL_DB
+              value: /data/sentinel.db
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: sentinel-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sentinel-data
+  namespace: sentinel-system
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-monitor
+  namespace: sentinel-system
+spec:
+  selector:
+    app: sentinel-monitor
+  ports:
+    - port: 8000
+      targetPort: 8000
