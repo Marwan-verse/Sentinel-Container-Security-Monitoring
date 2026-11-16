@@ -7,6 +7,9 @@ services:
     environment:
       SENTINEL_MODE: docker
       SENTINEL_DB: /data/sentinel.db
+      SENTINEL_FALCO_TOKEN: ${SENTINEL_FALCO_TOKEN:-}
+      SENTINEL_SCAN_IMAGES: ${SENTINEL_SCAN_IMAGES:-false}
+      TRIVY_CACHE_DIR: /data/trivy-cache
     volumes:
       - sentinel_data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
