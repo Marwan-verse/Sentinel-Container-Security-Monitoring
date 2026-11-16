@@ -67,6 +67,14 @@ spec:
               value: kubernetes
             - name: SENTINEL_DB
               value: /data/sentinel.db
+            - name: TRIVY_CACHE_DIR
+              value: /data/trivy-cache
+            - name: SENTINEL_FALCO_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-falco
+                  key: token
+                  optional: true
           volumeMounts:
             - name: data
               mountPath: /data

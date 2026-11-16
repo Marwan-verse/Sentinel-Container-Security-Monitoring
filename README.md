@@ -73,6 +73,75 @@ The lab creates a `sentinel-lab` namespace with Pod Security enforcement set to 
 
 Open alerts are correlated by workload and rule. The count grows when a matching runtime event repeats. Configuration findings remain a single alert across polls. Resource anomalies require at least eight previous samples and a significant jump over the rolling mean and standard deviation.
 
+## Runtime detection with Falco
+
+Sentinel accepts container alerts from [Falco](https://falco.org/docs/), so shell execution, sensitive file writes, and other process activity can be investigated alongside configuration findings. Falco must run on the monitored **Linux host or Kubernetes nodes** with rules enabled for the activity you want to detect. Installing Sentinel alone does not install a kernel sensor. On Windows, run the sensor in the monitored Linux environment.
+
+1. Configure a strong random `SENTINEL_FALCO_TOKEN` in the monitor environment. Compose passes this variable through; keep it in an untracked `.env` or your process environment. Restart the monitor after changing its environment.
+2. Enable Falco JSON output. Forward one event per request to `POST /api/runtime/falco` with `Authorization: Bearer <token>`.
+3. The included relay can forward Falco stdout. In the Python environment containing Sentinel and with the same token set, run on the Linux sensor host:
+
+   ```bash
+   sudo falco -o json_output=true | python -m sentinel.forward_falco
+   ```
+
+   Set `SENTINEL_FALCO_URL` if the monitor is elsewhere; use a trusted TLS endpoint for remote forwarding. The relay retries each delivery up to six times, then reports failure without printing its contents. It is not a durable event queue; use a persistent forwarding service if delivery guarantees are needed.
+
+For Kubernetes, create an optional `sentinel-falco` Secret in `sentinel-system` with a `token` key before restarting the Deployment. The manifest reads this key without requiring a Secret for installations that do not use Falco. Forward from the node sensor or a relay that supplies the bearer header to `http://sentinel-monitor.sentinel-system:8000/api/runtime/falco` within the trusted cluster network. Do not place tokens in committed YAML.
+
+Required JSON fields are `rule`, `priority`, `time` (ISO-8601 with timezone), and `output_fields.container.id`. A minimal event looks like:
+
+```json
+{
+  "rule": "Terminal shell in container",
+  "priority": "Warning",
+  "time": "2026-11-16T12:00:00.123456789Z",
+  "output_fields": {
+    "container.id": "0123456789ab",
+    "proc.name": "sh",
+    "evt.type": "execve"
+  }
+}
+```
+
+Use an actual inventoried container ID. Sentinel matches full IDs or unique prefixes of at least 12 characters, including Kubernetes runtime container IDs. Unknown, ambiguous, and host-only events are rejected with 422 so senders can retry after inventory collection. Repeated deliveries are deduplicated transactionally. Requests are limited to 256 KiB; the endpoint returns 503 when disabled and 401 for a bad token. Only allowlisted process/file metadata is persisted: raw output, command arguments, and arbitrary output fields are discarded. File paths and process names may still be sensitive.
+
+## Incident investigations
+
+The **Incidents** section opens an evidence timeline containing configuration changes, Falco activity, resource anomalies, and image findings. Different rules for the same workload join an incident while its last new signal is within a 30-minute ingestion-time idle window. After that window, or after manual resolution, the next new signal starts a new incident. Unchanged configuration polling and unchanged cached scan findings do not add timeline entries.
+
+Each entry keeps an immutable copy of its evidence and recommendation. Runtime timestamps are shown separately from reception time in the evidence API. A shared workload/time window indicates correlation, not proof of an attack or causal order. Acknowledge, resolve, and reopen incidents independently of individual alert statuses; resolving an incident does not resolve its underlying findings. Timelines can load earlier signals. Existing active alerts are imported once when an older database is opened.
+
+## Image vulnerability and secret scanning
+
+Open a workload and choose **Scan images with Trivy**. The Docker image includes Trivy 0.76.2. For a native Python deployment, install the [Trivy CLI](https://trivy.dev/docs/latest/getting-started/installation/) on PATH, or set `SENTINEL_TRIVY_BINARY` to its executable path. No scanner installation or image download occurs merely by starting the dashboard.
+
+- Scans run in one background worker, with at most eight distinct queued image IDs. The dashboard remains available while scans run. Scan failures are displayed per image; automatic retries back off for five minutes.
+- Only immutable SHA-256 image IDs/digests discovered from inventory are scanned. Mutable tags without a resolved ID display **unavailable** until the runtime provides one. Docker scans use the local image ID; Kubernetes scans use the runtime image reference. Private registries require Trivy's registry credentials in the monitor environment. A node-local ID inaccessible to Trivy may require registry access to a pullable digest.
+- Successful results are cached in SQLite by immutable reference for 24 hours and shared across workloads. The button forces a refresh. Set `SENTINEL_SCAN_IMAGES=true` to also scan discovered images automatically (off by default).
+- Results include vulnerability IDs, installed/fixed package versions, severity counts, and secret detection locations. Secret values, matching lines, and code excerpts are excluded from database/API/incident evidence. Raw reports exist only in a temporary directory during parsing and are removed on success or failure.
+- High/critical vulnerabilities or detected secrets create an image alert and incident evidence. Clean rescans resolve that image alert; replacing the image resolves findings attached to the old image. A scan failure preserves the previous successful report and labels the current attempt as failed.
+- Trivy needs network access for its vulnerability databases and remote images. Compose and Kubernetes persist its cache at `/data/trivy-cache`. Monitor disk and memory capacity when scanning large images; the API accepts reports up to 50 MiB.
+
+## Configuration history
+
+Workload details show the initial configuration snapshot and subsequent field-by-field before/after changes, including images/digests, privilege settings, mounts, capabilities, and Kubernetes service accounts/container security contexts. Identical polls, changed resource samples, runtime container IDs, and pod IP changes do not create snapshots. Snapshot changes also appear as incident signals and recent events.
+
+History is scoped to a Docker container ID or Kubernetes Pod UID. Replacing a container or Pod creates a new workload; cross-revision Deployment/Compose-service history is not inferred. Earlier snapshots can be loaded in the UI. The schema is extended automatically without deleting existing records; back up the SQLite database before upgrading. History, events, and incident evidence are retained until the database is archived or managed by the operator.
+
+New API routes (also visible in `/docs`):
+
+| Route | Purpose |
+| --- | --- |
+| `POST /api/runtime/falco` | Authenticated Falco ingestion |
+| `GET /api/incidents?status=open&key=...` | List/filter investigations |
+| `GET /api/incidents/{id}?limit=200&before=...` | Timeline page and `next_before` cursor |
+| `POST /api/incidents/{id}/status?status=resolved` | Update investigation status |
+| `GET /api/history/{workload-key}?limit=50&before=...` | Configuration snapshot page |
+| `POST /api/scans/{workload-key}?force=true` | Queue image scans (202) |
+
+`GET /api/containers/{workload-key}` also includes history, related incidents, and current image scan results. History pages are newest-first; pass the oldest entry ID as `before`. The original dashboard/API access model still applies: keep it local or port-forwarded unless you add authentication and authorization. The Falco token only protects its ingestion endpoint.
+
 ## Development
 
 ```bash
@@ -90,6 +159,11 @@ Environment variables:
 | `SENTINEL_MODE` | `auto` | `docker`, `kubernetes`, `all`, `auto`, or `off` |
 | `SENTINEL_DB` | `data/sentinel.db` | SQLite database path |
 | `SENTINEL_POLL_SECONDS` | `10` | Collector polling interval, minimum 5 seconds |
+| `SENTINEL_FALCO_TOKEN` | unset | Enables bearer-authenticated Falco ingestion |
+| `SENTINEL_FALCO_URL` | `http://127.0.0.1:8000/api/runtime/falco` | Destination used by the optional relay |
+| `SENTINEL_SCAN_IMAGES` | `false` | Automatically queue discovered immutable images |
+| `SENTINEL_TRIVY_BINARY` | `trivy` | Trivy executable name or absolute path |
+| `TRIVY_CACHE_DIR` | Trivy default | Downloaded scanner databases/cache; `/data/trivy-cache` in manifests |
 | `OPENAI_API_KEY` | unset | Enables the optional AI explanation button |
 | `OPENAI_MODEL` | `gpt-5-mini` | Model used for optional explanations |
 

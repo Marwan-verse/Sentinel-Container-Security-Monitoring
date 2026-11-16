@@ -22,13 +22,20 @@ def docker_item(container):
         "name": container.name, "namespace": "", "image": config.get("Image") or "",
         "state": (attrs.get("State") or {}).get("Status") or "unknown", "restarts": attrs.get("RestartCount") or 0,
         "details": {
+            "container_ids": [container.id],
+            "images": [{"name": container.name, "reference": config.get("Image") or "",
+                        "digest": attrs.get("Image") or ""}],
             "privileged": bool(host.get("Privileged")), "host_pid": host.get("PidMode") == "host",
             "host_network": host.get("NetworkMode") == "host",
             "host_path": any(m.get("Type") == "bind" for m in mounts),
             "docker_socket": any("docker.sock" in str(m.get("Source", "")) or "docker.sock" in str(m.get("Destination", "")) for m in mounts),
             "root_user": user in ("", "0", "root"),
+            "user": config.get("User") or "",
+            "read_only_root_filesystem": bool(host.get("ReadonlyRootfs")),
+            "capabilities": sorted(caps), "capabilities_drop": sorted(host.get("CapDrop") or []),
+            "security_options": sorted(host.get("SecurityOpt") or []),
             "dangerous_capabilities": sorted(SENSITIVE_CAPS.intersection(caps)),
-            "ports": host.get("PortBindings") or {}, "mounts": [{"source": m.get("Source"), "target": m.get("Destination"), "type": m.get("Type")} for m in mounts],
+            "ports": host.get("PortBindings") or {}, "mounts": [{"source": m.get("Source"), "target": m.get("Destination"), "type": m.get("Type"), "read_only": m.get("RW") is False} for m in mounts],
         },
     }
 
@@ -62,7 +69,17 @@ def quantity(value):
 
 def kubernetes_item(pod):
     spec, meta, status = pod.spec, pod.metadata, pod.status
-    contexts = [c.security_context for c in (spec.containers or [])]
+    containers = (spec.containers or []) + (getattr(spec, "init_containers", None) or []) + (getattr(spec, "ephemeral_containers", None) or [])
+    statuses = (status.container_statuses or []) + (getattr(status, "init_container_statuses", None) or []) + (getattr(status, "ephemeral_container_statuses", None) or [])
+    statuses_by_name = {s.name: s for s in statuses if getattr(s, "name", None)}
+    images = []
+    for c in containers:
+        container_status = statuses_by_name.get(getattr(c, "name", ""))
+        image_id = getattr(container_status, "image_id", None) or ""
+        image_id = image_id.split("://", 1)[-1]
+        images.append({"name": getattr(c, "name", "container"), "reference": c.image,
+                       "digest": image_id or (c.image if "@sha256:" in c.image else "")})
+    contexts = [c.security_context for c in containers]
     pod_context = spec.security_context
     user_ids = [getattr(c, "run_as_user", None) for c in contexts]
     if pod_context and pod_context.run_as_user is not None:
@@ -74,10 +91,19 @@ def kubernetes_item(pod):
     return {
         "key": f"k8s:{meta.uid}", "source": "kubernetes", "name": meta.name,
         "namespace": meta.namespace or "default",
-        "image": ", ".join(c.image for c in (spec.containers or [])),
+        "image": ", ".join(c.image for c in containers),
         "state": (status.phase or "unknown").lower(),
         "restarts": sum(s.restart_count or 0 for s in (status.container_statuses or [])),
         "details": {
+            "container_ids": [s.container_id.split("://", 1)[-1] for s in statuses if getattr(s, "container_id", None)],
+            "images": images,
+            "pod_security_context": pod_context.to_dict() if pod_context and hasattr(pod_context, "to_dict") else {},
+            "host_mounts": [{"name": v.name, "path": v.host_path.path, "type": v.host_path.type}
+                            for v in (spec.volumes or []) if v.host_path],
+            "container_configuration": [{"name": getattr(c, "name", "container"), "image": c.image,
+                                         "security_context": c.security_context.to_dict() if c.security_context and hasattr(c.security_context, "to_dict") else {},
+                                         "mounts": [m.to_dict() for m in (getattr(c, "volume_mounts", None) or [])]}
+                                        for c in containers],
             "privileged": any(bool(c and c.privileged) for c in contexts),
             "host_pid": bool(spec.host_pid), "host_network": bool(spec.host_network),
             "host_path": any(bool(v.host_path) for v in (spec.volumes or [])),
@@ -92,13 +118,21 @@ def kubernetes_item(pod):
 
 
 class CollectorManager:
-    def __init__(self, store, mode="auto", poll_seconds=10):
+    def __init__(self, store, mode="auto", poll_seconds=10, scanner=None):
         self.store = store
         self.mode = mode
         self.poll_seconds = poll_seconds
         self.stop = threading.Event()
         self.health = {"docker": "disabled", "kubernetes": "disabled"}
         self.threads = []
+        self.scanner = scanner
+
+    def _scan_images(self, item):
+        if self.scanner and os.getenv("SENTINEL_SCAN_IMAGES", "false").lower() == "true":
+            try:
+                self.scanner.request(item)
+            except RuntimeError as exc:
+                log.debug("Image scan not queued: %s", exc)
 
     def start(self):
         if self.mode in ("auto", "docker", "all"):
@@ -136,6 +170,7 @@ class CollectorManager:
                         previous = self.store.container(item["key"])
                         self.store.upsert_container(item)
                         inspect_configuration(self.store, item)
+                        self._scan_images(item)
                         if previous and item["restarts"] > previous["restarts"]:
                             difference = item["restarts"] - previous["restarts"]
                             self.store.alert(f"{item['key']}:restarts", "docker", item["key"], "restarts", "high",
@@ -210,6 +245,7 @@ class CollectorManager:
                     previous = self.store.container(item["key"])
                     self.store.upsert_container(item)
                     inspect_configuration(self.store, item)
+                    self._scan_images(item)
                     items[(item["namespace"], item["name"])] = item
                     if previous and item["restarts"] > previous["restarts"]:
                         self.store.alert(f"{item['key']}:restarts", "kubernetes", item["key"], "restarts", "high",

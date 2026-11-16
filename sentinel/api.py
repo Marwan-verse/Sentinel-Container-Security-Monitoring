@@ -1,36 +1,103 @@
 from contextlib import asynccontextmanager
+import hmac
+import json
+import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 
 from .collectors import CollectorManager
 from .config import DB_PATH, MODE, POLL_SECONDS
 from .store import Store, utcnow
 from . import explain as ai
+from .runtime import FalcoEvent, ingest
+from .scanning import ImageScanner
 
 
 def create_app(store=None, start_collectors=True):
     database = store or Store(DB_PATH)
-    manager = CollectorManager(database, MODE, POLL_SECONDS)
+    scanner = ImageScanner(database)
+    manager = CollectorManager(database, MODE, POLL_SECONDS, scanner=scanner)
 
     @asynccontextmanager
     async def lifespan(app):
         if start_collectors:
             manager.start()
-        yield
-        if start_collectors:
-            manager.close()
+        try:
+            yield
+        finally:
+            if start_collectors:
+                manager.close()
+            scanner.close()
 
-    app = FastAPI(title="Sentinel Container Monitor", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Sentinel Container Monitor", version="0.2.0", lifespan=lifespan)
     app.state.store = database
     app.state.collectors = manager
+    app.state.scanner = scanner
 
     @app.get("/api/health")
     def health():
         return {"status": "ok", "collectors": manager.health, "mode": manager.mode,
-                "ai_enabled": ai.enabled(), "time": utcnow()}
+                "ai_enabled": ai.enabled(), "time": utcnow(),
+                "runtime_enabled": bool(os.getenv("SENTINEL_FALCO_TOKEN")), "scanner_available": scanner.available()}
+
+    @app.post("/api/runtime/falco")
+    async def falco_event(request: Request):
+        token = os.getenv("SENTINEL_FALCO_TOKEN", "")
+        if not token:
+            raise HTTPException(503, "Falco ingestion is disabled; configure SENTINEL_FALCO_TOKEN")
+        if not hmac.compare_digest(request.headers.get("authorization", "").encode(), f"Bearer {token}".encode()):
+            raise HTTPException(401, "Invalid Falco bearer token")
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 256 * 1024:
+                raise HTTPException(413, "Falco event exceeds 256 KiB")
+        try:
+            event = FalcoEvent.model_validate(json.loads(body))
+            return ingest(database, event)
+        except (ValidationError, ValueError) as exc:
+            # Validation errors can contain original input, including secrets.
+            message = "Invalid Falco event" if isinstance(exc, ValidationError) else str(exc)
+            if isinstance(exc, json.JSONDecodeError):
+                message = "Invalid JSON"
+            raise HTTPException(422, message) from exc
+
+    @app.get("/api/history/{key:path}")
+    def history(key: str, limit: int = Query(50, ge=1, le=200), before: int | None = Query(None, ge=1)):
+        if not database.container(key):
+            raise HTTPException(404, "Container not found")
+        return database.configuration_history(key, limit=limit, before=before)
+
+    @app.get("/api/incidents")
+    def incidents(status: str | None = Query(None, pattern="^(open|acknowledged|resolved)$"), key: str | None = None):
+        return database.incidents(status=status, key=key)
+
+    @app.get("/api/incidents/{incident_id}")
+    def incident(incident_id: int, limit: int = Query(200, ge=1, le=500), before: int | None = Query(None, ge=1)):
+        result = database.incident(incident_id, limit=limit, before=before)
+        if not result:
+            raise HTTPException(404, "Incident not found")
+        return result
+
+    @app.post("/api/incidents/{incident_id}/status")
+    def incident_status(incident_id: int, status: str = Query(pattern="^(open|acknowledged|resolved)$")):
+        if not database.set_incident_status(incident_id, status):
+            raise HTTPException(404, "Incident not found")
+        return {"id": incident_id, "status": status}
+
+    @app.post("/api/scans/{key:path}", status_code=202)
+    def scan_images(key: str, force: bool = False):
+        item = database.container(key)
+        if not item:
+            raise HTTPException(404, "Container not found")
+        try:
+            return scanner.request(item, force=force)
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
 
     @app.get("/api/summary")
     def summary():
@@ -46,7 +113,8 @@ def create_app(store=None, start_collectors=True):
         if not item:
             raise HTTPException(404, "Container not found")
         return {**item, "alerts": database.alerts(key=key), "events": database.events(key=key),
-                "samples": database.recent_samples(key, 60)}
+                "samples": database.recent_samples(key, 60), "history": database.configuration_history(key),
+                "incidents": database.incidents(key=key), "image_scans": scanner.results(item)}
 
     @app.get("/api/alerts")
     def alerts(status: str | None = Query(default=None, pattern="^(open|acknowledged|resolved)$")):

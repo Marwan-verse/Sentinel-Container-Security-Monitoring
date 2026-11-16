@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import './style.css'
+import { IncidentPanel, WorkloadSecurity } from './SecurityPanels'
 
 const formatTime = value => value ? new Date(value).toLocaleString() : '—'
 const formatMemory = value => value == null ? '—' : `${(value / 1048576).toFixed(1)} MiB`
@@ -26,6 +27,7 @@ function App() {
   const [alerts, setAlerts] = useState([])
   const [containers, setContainers] = useState([])
   const [events, setEvents] = useState([])
+  const [incidents, setIncidents] = useState([])
   const [query, setQuery] = useState('')
   const [showResolved, setShowResolved] = useState(false)
   const [showAllAlerts, setShowAllAlerts] = useState(false)
@@ -38,14 +40,15 @@ function App() {
 
   async function refresh() {
     try {
-      const [nextSummary, nextHealth, nextAlerts, nextContainers, nextEvents] = await Promise.all([
-        api('/summary'), api('/health'), api('/alerts'), api('/containers'), api('/events')
+      const [nextSummary, nextHealth, nextAlerts, nextContainers, nextEvents, nextIncidents] = await Promise.all([
+        api('/summary'), api('/health'), api('/alerts'), api('/containers'), api('/events'), api('/incidents')
       ])
       setSummary(nextSummary)
       setHealth(nextHealth)
       setAlerts(nextAlerts)
       setContainers(nextContainers)
       setEvents(nextEvents)
+      setIncidents(nextIncidents)
       setUpdatedAt(new Date())
       setError('')
     } catch (reason) {
@@ -65,6 +68,7 @@ function App() {
       return
     }
     let active = true
+    setDetail(previous => previous?.key === selectedKey ? previous : null)
     api(`/containers/${encodeURIComponent(selectedKey)}`)
       .then(value => { if (active) setDetail(value) })
       .catch(reason => { if (active) setError(`Could not load workload: ${reason.message}`) })
@@ -203,6 +207,8 @@ function App() {
         </div> : <div className="empty">No workloads to show.</div>}
       </section>
 
+      <IncidentPanel incidents={incidents} api={api} updatedAt={updatedAt} refresh={refresh} search={search} showResolved={showResolved} />
+
       <section className="section" aria-labelledby="events-title">
         <div className="section-heading"><div><h2 id="events-title">Recent events</h2><p>Latest container activity</p></div></div>
         {events.length ? <div className="list">
@@ -228,6 +234,7 @@ function App() {
           <div className="configuration">{Object.entries(detail.details).map(([key, value]) => <div key={key}><span>{key.replaceAll('_', ' ')}</span><strong>{typeof value === 'object' ? JSON.stringify(value) : String(value ?? '—')}</strong></div>)}</div>
           <h3>Recent events</h3>
           {detail.events.length ? detail.events.slice(0, 6).map(event => <p className="detail-event" key={event.id}>{event.message}</p>) : <p className="muted">No recent events.</p>}
+          <WorkloadSecurity key={detail.key} detail={detail} api={api} refresh={refresh} scannerAvailable={health?.scanner_available} />
         </> : <p>Loading workload…</p>}
       </div>
     </div>}
